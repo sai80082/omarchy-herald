@@ -52,6 +52,31 @@ The daemon is the source of truth and the panel is a view of it. If you would
 rather run the watcher under systemd, set `"managed": false` in the config: the
 plugin then stops spawning its own and just reads the history file.
 
+## Requirements
+
+Everything here except Python is already on a stock Omarchy box.
+
+| Needs | For | Package |
+|---|---|---|
+| `python3` | the mail watcher | `python` |
+| `secret-tool` | reading the IMAP password and API key from the login keyring | `libsecret` |
+| `wl-copy` | putting a code on the clipboard | `wl-clipboard` |
+| `omarchy notification send` | raising the toast through the shell's own server | ships with Omarchy |
+| `jq`, `gum` | `herald-setup` only — `gum` degrades to plain prompts if absent | `jq`, `gum` |
+
+No Python packages. The daemon is stdlib-only, so there is nothing to
+`pip install` and nothing to keep patched. Python 3.13 or newer uses
+`imaplib`'s native `IDLE`; older versions fall back to polling on
+`scan.pollSeconds`.
+
+**Privilege boundary:** nothing in this plugin uses `sudo`, `pkexec`, or any
+other escalation, and nothing is installed outside your home directory. It
+runs as you, inside `omarchy-shell`, like every Omarchy plugin.
+
+**Network:** two outbound connections, both of which you configure — your IMAP
+host, and the OpenAI-compatible endpoint in `llm.baseUrl`. There are no
+analytics, no telemetry, and no calls to anything else.
+
 ## Install
 
 ```bash
@@ -129,6 +154,27 @@ If the endpoint is unreachable, or the key is wrong, or the model returns
 nonsense, the daemon falls back to local pattern matching rather than going
 quiet. An OTP still reaches the screen when the network is having a bad day —
 it just arrives with less context attached.
+
+## Removing it
+
+```bash
+omarchy plugin remove io.github.sai80082.herald
+```
+
+That stops the watcher and takes the widget off the bar. Your account details
+outlive it on purpose, so reinstalling does not mean setting it up again.
+To remove those too:
+
+```bash
+rm -rf ~/.config/omarchy/herald          # host, endpoint, notification rules
+rm -rf ~/.local/state/omarchy/herald     # classified events, seen marker, last UID
+secret-tool clear service omarchy-herald account imap
+secret-tool clear service omarchy-herald account llm
+```
+
+Nothing else on the system is touched — no files outside those paths, no
+system services, and no changes to anyone else's config. Your `shell.json`
+loses only the plugin's own bar entry, which `omarchy plugin remove` handles.
 
 ## What leaves your machine
 
