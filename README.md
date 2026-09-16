@@ -7,6 +7,11 @@ make — classified by any OpenAI-compatible endpoint.
 
 Everything else stays in your inbox where it belongs.
 
+![Herald's bar glyph and panel: a live one-time code set at display size over
+the recent codes, transactions and alerts](preview.png)
+
+The toast that arrives with it:
+
 ```
 󰯄  Google  ·  281 940
    Sign-in verification  ·  10m left  ·  click to copy
