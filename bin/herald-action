@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""herald-action — what clicking a Herald notification does.
+
+Invoked by omarchy-notification-send's --exec with a verb and an event id.
+The id is looked up in the event history rather than carrying the code in the
+argv, so a one-time code never lands in a process listing.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+
+HOME = os.path.expanduser("~")
+EVENTS_PATH = os.path.join(HOME, ".local", "state", "omarchy", "herald", "events.jsonl")
+PLUGIN_ID = os.environ.get("HERALD_PLUGIN_ID", "io.github.sai80082.herald")
+
+
+def find_event(event_id):
+    try:
+        with open(EVENTS_PATH, "r", encoding="utf-8") as handle:
+            rows = handle.read().splitlines()
+    except OSError:
+        return None
+    # Newest first: an id collision between a trimmed and a current event
+    # should resolve to the one still on screen.
+    for line in reversed(rows):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row.get("id") == event_id:
+            return row
+    return None
+
+
+def toast(headline, body="", glyph="\U000f012c", urgency="low"):
+    argv = ["omarchy", "notification", "send", "--app-name", "herald",
+            "-g", glyph, "-u", urgency, "-t", "3000", headline]
+    if body:
+        argv.append(body)
+    subprocess.run(argv, check=False, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL)
+
+
+def copy(event):
+    code = str(event.get("code") or "")
+    if not code:
+        return show(event)
+    subprocess.run(["wl-copy", "--sensitive"], input=code, text=True, check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    toast(f"Copied · {event.get('title') or 'code'}", "Ready to paste")
+    return 0
+
+
+def show(_event):
+    subprocess.run(["omarchy-shell", "shell", "summon", PLUGIN_ID, "{}"],
+                   check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return 0
+
+
+def main():
+    if len(sys.argv) < 3:
+        print("usage: herald-action <copy|show> <event-id>", file=sys.stderr)
+        return 2
+
+    verb, event_id = sys.argv[1], sys.argv[2]
+    event = find_event(event_id)
+    if event is None:
+        toast("Herald", "That notification is no longer in history",
+              "\U000f0028", "low")
+        return 1
+
+    if verb == "copy":
+        return copy(event)
+    if verb == "show":
+        return show(event)
+    print(f"unknown verb: {verb}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

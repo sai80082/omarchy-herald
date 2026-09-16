@@ -1,0 +1,78 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.sai80082.herald",
+  "name": "Herald",
+  "version": "0.1.0",
+  "author": "sai80082",
+  "license": "MIT",
+  "description": "Turns arriving mail into the notification you actually wanted: one-time codes (OTP / 2FA / verification codes) set large and one click from the clipboard, bank and card transaction alerts with the amount and merchant, and security warnings — classified by any OpenAI-compatible endpoint over plain IMAP. Not a mail client: it never shows you your inbox.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Herald",
+    "description": "Mail glyph that wakes up when something actionable arrives. Click for recent one-time codes, transactions, and security alerts, with click-to-copy and the watcher's connection state.",
+    "category": "Communication",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "badge": "actionable",
+      "hideWhenQuiet": false,
+      "historyRows": 12
+    },
+    "schema": [
+      {
+        "key": "badge",
+        "type": "enum",
+        "label": "Badge count",
+        "description": "Which unread events put a count next to the glyph.",
+        "options": [
+          "actionable",
+          "all",
+          "off"
+        ],
+        "defaultValue": "actionable"
+      },
+      {
+        "key": "hideWhenQuiet",
+        "type": "boolean",
+        "label": "Hide when nothing is waiting",
+        "description": "Take the glyph out of the bar entirely until an unread event arrives.",
+        "defaultValue": false
+      },
+      {
+        "key": "historyRows",
+        "type": "number",
+        "label": "Rows in the panel",
+        "description": "How many recent events the panel lists.",
+        "defaultValue": 12
+      }
+    ]
+  },
+  "metadata": {
+    "category": "Communication",
+    "documentation": "https://github.com/sai80082/omarchy-herald#readme",
+    "issues": "https://github.com/sai80082/omarchy-herald/issues",
+    "repository": "https://github.com/sai80082/omarchy-herald",
+    "keywords": [
+      "mail",
+      "email",
+      "imap",
+      "otp",
+      "2fa",
+      "totp",
+      "verification code",
+      "transactions",
+      "bank alert",
+      "notifications",
+      "openai",
+      "llm"
+    ]
+  }
+}

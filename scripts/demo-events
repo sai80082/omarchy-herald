@@ -1,0 +1,54 @@
+#!/bin/bash
+# demo-events — fill the panel with plausible events, no mailbox required.
+#
+# For checking the panel against a theme, or seeing what Herald looks like
+# before committing an account to it. Writes only to the history file; nothing
+# is sent, nothing is notified. `--clear` puts it back.
+
+set -euo pipefail
+STATE="$HOME/.local/state/omarchy/herald"
+FILE="$STATE/events.jsonl"
+
+if [[ ${1-} == "--clear" ]]; then
+  rm -f "$FILE" "$STATE/seen.json"
+  echo "cleared $FILE"
+  exit 0
+fi
+
+mkdir -p "$STATE"
+python3 - "$FILE" <<'PY'
+import json, os, sys, time
+
+now = time.time()
+rows = [
+    dict(category="otp", title="Fastmail", headline="Fastmail code", detail="New device sign-in",
+         code="903117", expires_minutes=15, subject="Your Fastmail verification code",
+         sender="Fastmail <noreply@fastmail.com>", ago=60),
+    dict(category="transaction", title="Stripe", headline="Payout sent", detail="Monthly payout",
+         amount="$1,840.00", merchant="Stripe Payouts", account_hint="••9021",
+         subject="Your payout is on the way", sender="Stripe <no-reply@stripe.com>", ago=1800),
+    dict(category="security", title="GitHub", headline="New sign-in from Firefox",
+         detail="Bengaluru, IN · 103.21.x.x", subject="New sign-in to your account",
+         sender="GitHub <noreply@github.com>", ago=7200),
+    dict(category="delivery", title="Amazon", headline="Out for delivery",
+         detail="Mechanical keyboard · arrives today",
+         subject="Your package is out for delivery", sender="Amazon <ship@amazon.in>", ago=90000),
+]
+
+path = sys.argv[1]
+lines = []
+for index, row in enumerate(rows):
+    event = {"t": "event", "id": f"demo{index}", "uid": 900 + index, "code": "", "amount": "",
+             "merchant": "", "account_hint": "", "expires_minutes": 0, "confidence": 0.9,
+             "source": "demo", "notified": False, "account": "demo@example.com"}
+    event.update({k: v for k, v in row.items() if k != "ago"})
+    event["receivedAt"] = now - row["ago"]
+    lines.append(json.dumps(event, ensure_ascii=False))
+
+flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+with os.fdopen(os.open(path, flags, 0o600), "w", encoding="utf-8") as handle:
+    handle.write("\n".join(lines) + "\n")
+print(f"wrote {len(lines)} demo events to {path}")
+PY
+echo '{"seenBefore": 0}' > "$STATE/seen.json"
+echo "open the panel to see them; ./scripts/demo-events --clear to remove"

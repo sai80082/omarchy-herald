@@ -1,0 +1,148 @@
+#!/bin/bash
+# herald-setup — collect the IMAP account and the LLM endpoint, once.
+#
+# Passwords go to the login keyring via secret-tool and never touch the config
+# file. The config file itself holds only the things you would be happy to
+# paste into a bug report.
+
+set -euo pipefail
+
+CONFIG_DIR="$HOME/.config/omarchy/herald"
+CONFIG="$CONFIG_DIR/config.json"
+SERVICE="omarchy-herald"
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+ask() { # ask <prompt> <default>
+  local prompt=$1 default=${2-} value
+  if have gum; then
+    value=$(gum input --prompt "$prompt " --value "$default" --placeholder "$default")
+  else
+    read -r -p "$prompt [$default] " value
+  fi
+  printf '%s' "${value:-$default}"
+}
+
+ask_secret() { # ask_secret <prompt>
+  local prompt=$1 value
+  if have gum; then
+    value=$(gum input --password --prompt "$prompt ")
+  else
+    read -r -s -p "$prompt " value
+    echo >&2
+  fi
+  printf '%s' "$value"
+}
+
+choose() { # choose <prompt> <options...>
+  local prompt=$1
+  shift
+  if have gum; then
+    gum choose --header "$prompt" "$@"
+  else
+    echo "$prompt" >&2
+    select opt in "$@"; do
+      [[ -n ${opt-} ]] && { printf '%s' "$opt"; return; }
+    done
+  fi
+}
+
+say() { if have gum; then gum style --foreground 4 "$*"; else echo "$*"; fi; }
+
+store_secret() { # store_secret <account> <label>
+  local account=$1 label=$2 secret
+  secret=$(ask_secret "$label")
+  if [[ -z $secret ]]; then
+    echo "  skipped — nothing stored for '$account'" >&2
+    return
+  fi
+  printf '%s' "$secret" |
+    secret-tool store --label="Herald ($account)" service "$SERVICE" account "$account"
+  echo "  stored in the login keyring as $SERVICE/$account" >&2
+}
+
+for tool in secret-tool python3 jq; do
+  have "$tool" || { echo "herald-setup needs $tool" >&2; exit 1; }
+done
+
+say "── Mailbox ────────────────────────────────────────────"
+imap_host=$(ask "IMAP host" "imap.fastmail.com")
+imap_port=$(ask "IMAP port" "993")
+imap_user=$(ask "Username" "${USER}@example.com")
+imap_box=$(ask "Mailbox" "INBOX")
+
+say "── Model ──────────────────────────────────────────────"
+endpoint=$(choose "Where should classification run?" \
+  "OpenAI (api.openai.com)" \
+  "Local (Ollama / LM Studio)" \
+  "Other OpenAI-compatible endpoint")
+
+case "$endpoint" in
+"OpenAI"*) llm_base="https://api.openai.com/v1"; llm_model=$(ask "Model" "gpt-4o-mini") ;;
+"Local"*) llm_base=$(ask "Base URL" "http://localhost:11434/v1"); llm_model=$(ask "Model" "llama3.1:8b") ;;
+*) llm_base=$(ask "Base URL" "https://openrouter.ai/api/v1"); llm_model=$(ask "Model" "openai/gpt-4o-mini") ;;
+esac
+
+mkdir -p "$CONFIG_DIR"
+
+# Written through python rather than a heredoc so every value is JSON-encoded
+# as data — a password manager's stray quote in a username cannot break the
+# file, and nothing here is shell-expanded.
+IMAP_HOST=$imap_host IMAP_PORT=$imap_port IMAP_USER=$imap_user IMAP_BOX=$imap_box \
+LLM_BASE=$llm_base LLM_MODEL=$llm_model CONFIG=$CONFIG python3 - <<'PY'
+import json, os
+
+path = os.environ["CONFIG"]
+try:
+    with open(path, encoding="utf-8") as handle:
+        config = json.load(handle)
+except (OSError, ValueError):
+    config = {}
+
+config.setdefault("version", 1)
+config.setdefault("imap", {}).update({
+    "host": os.environ["IMAP_HOST"],
+    "port": int(os.environ["IMAP_PORT"] or 993),
+    "username": os.environ["IMAP_USER"],
+    "mailbox": os.environ["IMAP_BOX"] or "INBOX",
+    "ssl": True,
+    "secretService": "omarchy-herald",
+    "secretAccount": "imap",
+})
+config.setdefault("llm", {}).update({
+    "enabled": True,
+    "baseUrl": os.environ["LLM_BASE"],
+    "model": os.environ["LLM_MODEL"],
+    "secretService": "omarchy-herald",
+    "secretAccount": "llm",
+})
+config.setdefault("notify", {}).setdefault("categories", {
+    "otp": "normal", "transaction": "normal", "security": "critical",
+    "delivery": "low", "calendar": "low", "other": "off",
+})
+config.setdefault("scan", {}).setdefault("backfill", 0)
+
+os.makedirs(os.path.dirname(path), exist_ok=True)
+tmp = path + ".tmp"
+with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w",
+               encoding="utf-8") as handle:
+    json.dump(config, handle, indent=2)
+    handle.write("\n")
+os.replace(tmp, path)
+print(f"wrote {path}")
+PY
+
+say "── Secrets ────────────────────────────────────────────"
+store_secret imap "IMAP password (an app password, not your login password)"
+if [[ $llm_base != http://localhost* && $llm_base != http://127.0.0.1* ]]; then
+  store_secret llm "API key for $llm_base"
+else
+  echo "  local endpoint — no API key stored" >&2
+fi
+
+say "── Check ──────────────────────────────────────────────"
+echo "Classify your three most recent messages without notifying:"
+echo
+echo "  \"\$(dirname \"\$0\")/herald-daemon\" --once 3 --dry-run | jq ."
+echo
+echo "Then enable the plugin:  omarchy plugin enable io.github.sai80082.herald"

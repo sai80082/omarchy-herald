@@ -1,0 +1,33 @@
+#!/bin/bash
+# dev-install — copy this checkout into the live plugin directory.
+#
+# Omarchy only discovers plugins under ~/.config/omarchy/plugins, and plugin
+# folders may not contain symlinks, so development is a copy. Everything under
+# that directory hot-reloads on write; rescanPlugins is the belt-and-braces
+# path for a manifest change.
+
+set -euo pipefail
+
+PLUGIN_ID="${HERALD_PLUGIN_ID:-io.github.sai80082.herald}"
+SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DEST="$HOME/.config/omarchy/plugins/$PLUGIN_ID"
+
+mkdir -p "$DEST"
+
+if command -v rsync >/dev/null 2>&1; then
+  rsync -a --delete \
+    --exclude '.git' --exclude 'scripts' --exclude 'tests' \
+    --exclude '*.pyc' --exclude '__pycache__' \
+    "$SRC/" "$DEST/"
+else
+  find "$DEST" -mindepth 1 -delete
+  tar -C "$SRC" --exclude='.git' --exclude='scripts' --exclude='tests' -cf - . |
+    tar -C "$DEST" -xf -
+fi
+
+chmod +x "$DEST"/bin/* 2>/dev/null || true
+echo "installed -> $DEST"
+
+if command -v omarchy-shell >/dev/null 2>&1; then
+  omarchy-shell shell rescanPlugins >/dev/null 2>&1 && echo "rescanned" || true
+fi

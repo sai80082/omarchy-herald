@@ -1,0 +1,23 @@
+#!/bin/bash
+# Every test Herald has. No mail server, no API key, no running shell needed:
+# the IMAP conversation and the model endpoint are both faked in-process.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+echo "── daemon ─────────────────────────────────────────────"
+python3 tests/test_daemon.py 2>&1 | grep -v ResourceWarning
+
+echo
+echo "── integration (fake IMAP + fake model) ───────────────"
+python3 tests/test_integration.py 2>&1 | grep -viE "resourcewarning|tracemalloc|unittest/suite|still running|for index, test|return self.run"
+
+echo
+echo "── presentation model ─────────────────────────────────"
+node --test tests/model.test.js
+
+echo
+echo "── manifest ───────────────────────────────────────────"
+jq -e . manifest.json > /dev/null && echo "manifest.json parses"
+if command -v omarchy >/dev/null 2>&1 && [[ -d "$HOME/.config/omarchy/plugins/io.github.sai80082.herald" ]]; then
+  omarchy plugin validate "$HOME/.config/omarchy/plugins/io.github.sai80082.herald" && echo "plugin folder validates"
+fi

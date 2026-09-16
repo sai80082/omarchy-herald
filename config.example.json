@@ -1,0 +1,65 @@
+{
+  "version": 1,
+
+  "//managed": "Set false when you run herald-daemon yourself (systemd, a terminal). The plugin then only reads events.jsonl instead of spawning its own watcher.",
+  "managed": true,
+
+  "imap": {
+    "host": "imap.fastmail.com",
+    "port": 993,
+    "username": "you@example.com",
+    "mailbox": "INBOX",
+    "ssl": true,
+    "starttls": false,
+    "secretService": "omarchy-herald",
+    "secretAccount": "imap",
+    "//passwordCommand": "Optional. Overrides the keyring, e.g. [\"pass\", \"show\", \"mail/imap\"].",
+    "passwordCommand": []
+  },
+
+  "llm": {
+    "enabled": true,
+    "baseUrl": "https://api.openai.com/v1",
+    "model": "gpt-4o-mini",
+    "secretService": "omarchy-herald",
+    "secretAccount": "llm",
+    "apiKeyCommand": [],
+    "timeoutSeconds": 45,
+    "//maxBodyChars": "How much of the message body is sent for classification.",
+    "maxBodyChars": 4000,
+    "//maxTokens": "0 omits the cap entirely, which is what reasoning models want.",
+    "maxTokens": 0,
+    "extraHeaders": {}
+  },
+
+  "notify": {
+    "//categories": "Urgency per category, or \"off\" to record the event without a toast.",
+    "categories": {
+      "otp": "normal",
+      "transaction": "normal",
+      "security": "critical",
+      "delivery": "low",
+      "calendar": "low",
+      "other": "off"
+    },
+    "autoCopyOtp": true,
+    "expireMs": 12000,
+    "//minConfidence": "Verdicts below this are recorded but never raise a toast.",
+    "minConfidence": 0.35
+  },
+
+  "scan": {
+    "//backfill": "Messages to classify on first run for a mailbox. 0 means only new mail.",
+    "backfill": 0,
+    "//maxPerCycle": "Ceiling on one batch, so a reconnect after a long offline spell cannot fire fifty toasts.",
+    "maxPerCycle": 12,
+    "//pollSeconds": "Only used when the server has no usable IDLE.",
+    "pollSeconds": 300,
+    "//senderDenylist": "Case-insensitive regexes matched against the From header.",
+    "senderDenylist": [
+      "newsletter@",
+      "no-reply@marketing\\."
+    ],
+    "subjectDenylist": []
+  }
+}

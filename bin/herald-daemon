@@ -1,0 +1,1263 @@
+#!/usr/bin/env python3
+"""herald-daemon — watch an IMAP mailbox and announce what actually matters.
+
+Arriving mail is fetched, reduced to a short plain-text excerpt, and handed to
+an OpenAI-compatible endpoint that returns a structured verdict: is this a
+one-time code, a transaction, a security alert, a delivery, a calendar
+invite, or nothing worth interrupting anyone for. Each verdict becomes an
+Omarchy notification and a JSON line on stdout.
+
+The JSON lines are the whole interface to the shell plugin. Nothing else is
+printed to stdout, so the plugin can parse the stream without a framing
+protocol, and `herald-daemon --once` in a terminal shows exactly what the
+plugin would see.
+
+Stdlib only, on purpose: this runs on a stock Omarchy box with no pip install
+and nothing to keep up to date.
+"""
+
+from __future__ import annotations
+
+import argparse
+import email
+import email.header
+import email.utils
+import hashlib
+import imaplib
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from html.parser import HTMLParser
+
+HOME = os.path.expanduser("~")
+CONFIG_PATH = os.path.join(HOME, ".config", "omarchy", "herald", "config.json")
+STATE_DIR = os.path.join(HOME, ".local", "state", "omarchy", "herald")
+EVENTS_PATH = os.path.join(STATE_DIR, "events.jsonl")
+STATE_PATH = os.path.join(STATE_DIR, "state.json")
+
+# History the panel can replay after a shell restart. Ten screens' worth is
+# plenty for "what did I just miss" and keeps the file small enough to read
+# and rewrite whole on every append.
+EVENT_HISTORY_LIMIT = 200
+
+# RFC 2177 puts the ceiling at 29 minutes; servers drop idle connections that
+# sit past it without a fresh DONE/IDLE round trip.
+IDLE_SECONDS = 29 * 60
+
+CATEGORIES = ("otp", "transaction", "security", "delivery", "calendar", "other")
+
+# Exit codes the shell plugin reads back. A watcher that stops for one of
+# these is not coming back on a timer: retrying a missing password or a
+# rejected login only produces log noise, and repeated rejections are how
+# accounts get locked. Service.qml parks on these and waits for the config
+# file to change or for someone to ask for a reconnect.
+EXIT_UNCONFIGURED = 3
+EXIT_AUTH = 4
+
+# Consecutive login rejections tolerated before giving up. More than one
+# because a server can refuse a login it will accept a moment later; not many
+# more, because a provider counts them.
+MAX_AUTH_FAILURES = 3
+
+
+class FatalConfig(Exception):
+    """The config cannot work as written. Retrying changes nothing."""
+
+
+class AuthRejected(Exception):
+    """The server refused these credentials."""
+
+GLYPHS = {
+    "otp": "\U000f0bc4",          # nf-md-shield_key
+    "transaction": "\U000f019b",  # nf-md-credit_card
+    "security": "\U000f0ecc",     # nf-md-shield_alert
+    "delivery": "\U000f0788",     # nf-md-truck_fast
+    "calendar": "\U000f00ed",     # nf-md-calendar
+    "other": "\U000f01ee",        # nf-md-email
+}
+
+DEFAULTS = {
+    "version": 1,
+    "imap": {
+        "host": "",
+        "port": 993,
+        "username": "",
+        "mailbox": "INBOX",
+        "ssl": True,
+        "starttls": False,
+        "secretService": "omarchy-herald",
+        "secretAccount": "imap",
+        "passwordCommand": [],
+    },
+    "llm": {
+        "enabled": True,
+        "baseUrl": "https://api.openai.com/v1",
+        "model": "gpt-4o-mini",
+        "secretService": "omarchy-herald",
+        "secretAccount": "llm",
+        "apiKeyCommand": [],
+        "timeoutSeconds": 45,
+        "maxBodyChars": 4000,
+        "maxTokens": 0,
+        "extraHeaders": {},
+    },
+    "notify": {
+        # Per-category urgency, or "off" to record the event without a toast.
+        "categories": {
+            "otp": "normal",
+            "transaction": "normal",
+            "security": "critical",
+            "delivery": "low",
+            "calendar": "low",
+            "other": "off",
+        },
+        "autoCopyOtp": True,
+        "expireMs": 12000,
+        "minConfidence": 0.35,
+    },
+    "scan": {
+        # Messages to classify on first run. 0 means "only mail that arrives
+        # from now on" — the safe default, since a backfill of a busy inbox is
+        # a surprise bill.
+        "backfill": 0,
+        "maxPerCycle": 12,
+        "pollSeconds": 300,
+        "senderDenylist": [],
+        "subjectDenylist": [],
+    },
+}
+
+
+# --------------------------------------------------------------- plumbing
+
+
+def emit(obj):
+    """One JSON object per line on stdout. The plugin's entire input."""
+    try:
+        sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+    except (BrokenPipeError, ValueError):
+        # The shell went away mid-write; nothing left to talk to.
+        os._exit(0)
+
+
+def log(level, msg):
+    emit({"t": "log", "level": level, "msg": str(msg)[:600], "ts": time.time()})
+
+
+def status(state, detail="", account=""):
+    emit({"t": "status", "state": state, "detail": str(detail)[:300],
+          "account": str(account)[:200], "ts": time.time()})
+
+
+def deep_merge(base, override):
+    out = dict(base)
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def load_config(path):
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as handle:
+        return deep_merge(DEFAULTS, json.load(handle))
+
+
+def run_capture(argv, timeout=20):
+    try:
+        done = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return done.stdout.strip() if done.returncode == 0 else ""
+
+
+def resolve_secret(env_name, section):
+    """Env var, then an explicit command, then the login keyring.
+
+    The keyring is the intended home for both secrets; the env var exists so a
+    terminal run can be pointed at a throwaway account without touching it, and
+    the command hook covers `pass`, `gopass`, and friends.
+    """
+    from_env = os.environ.get(env_name, "")
+    if from_env:
+        return from_env
+
+    command = section.get("passwordCommand") or section.get("apiKeyCommand") or []
+    if isinstance(command, str):
+        command = ["sh", "-c", command]
+    if command:
+        value = run_capture(list(command))
+        if value:
+            return value
+
+    service = section.get("secretService", "")
+    account = section.get("secretAccount", "")
+    if service and account:
+        return run_capture(
+            ["secret-tool", "lookup", "service", service, "account", account]
+        )
+    return ""
+
+
+def read_state():
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+def write_state(state):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(state, handle)
+    os.replace(tmp, STATE_PATH)
+
+
+def append_event(event):
+    """Append to the history file, trimming to the newest EVENT_HISTORY_LIMIT.
+
+    Written 0600: an OTP that is still valid lives in here, and so does the
+    subject line of every classified message.
+    """
+    os.makedirs(STATE_DIR, exist_ok=True)
+    rows = []
+    try:
+        with open(EVENTS_PATH, "r", encoding="utf-8") as handle:
+            rows = [line for line in handle.read().splitlines() if line.strip()]
+    except OSError:
+        pass
+    rows.append(json.dumps(event, ensure_ascii=False))
+    rows = rows[-EVENT_HISTORY_LIMIT:]
+
+    tmp = EVENTS_PATH + ".tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    with os.fdopen(os.open(tmp, flags, 0o600), "w", encoding="utf-8") as handle:
+        handle.write("\n".join(rows) + "\n")
+    os.replace(tmp, EVENTS_PATH)
+
+
+# ------------------------------------------------------------ mail parsing
+
+
+# ------------------------------------------------------------ CSS removal
+#
+# None of this reaches the model. A marketing email is mostly stylesheet by
+# weight, and every byte of it is billed, counted against the body limit, and
+# read by the model as if it meant something. Worse, it is full of digits —
+# `600px`, `#0a0`, `max-width:4px` — which is exactly what a classifier
+# hunting for a one-time code does not need to see.
+#
+# Stripping happens twice, at two different levels, because CSS arrives by
+# more than one route:
+#
+#   1. Markup level, before the parser: <style> and <script> elements, and
+#      HTML comments (Outlook conditional blocks hide whole stylesheets in
+#      them). This also protects the regex fallback below, which strips tags
+#      but would otherwise keep everything between them.
+#   2. Text level, after extraction: senders who paste a stylesheet into the
+#      text/plain part, and anything the parser let through. That part never
+#      goes near an HTML parser, so it needs its own pass.
+
+HTML_COMMENT = re.compile(r"<!--.*?-->", re.S)
+STYLE_ELEMENT = re.compile(r"<\s*(style|script)\b[^>]*>(.*?)<\s*/\s*\1\s*>", re.I | re.S)
+STYLE_OPEN = re.compile(r"<\s*(style|script)\b[^>]*>", re.I)
+
+AT_RULE = re.compile(
+    r"@(?:media|supports|font-face|(?:-[a-z]+-)?keyframes|import|charset|page|namespace)\b",
+    re.I)
+
+# One declaration: `color: #fff`, `margin-top:0`. Braces are excluded so a
+# nested block can never be mistaken for one.
+DECLARATION = re.compile(r"^\s*[-a-zA-Z_][-a-zA-Z0-9_]*\s*:\s*[^;{}]*$")
+
+# Bare element selectors worth recognising. Without this list a run of prose
+# sitting in front of a brace would read as a selector and be deleted with it.
+SELECTOR_ELEMENTS = {
+    "a", "b", "body", "br", "center", "div", "em", "font", "h1", "h2", "h3",
+    "h4", "h5", "h6", "head", "html", "i", "img", "li", "ol", "p", "small",
+    "span", "strong", "table", "tbody", "td", "th", "thead", "tr", "u", "ul",
+    "*",
+}
+SELECTOR_TOKEN = re.compile(r"^[a-zA-Z*][\w-]*$")
+
+
+def strip_style_elements(raw):
+    """Drop <style>/<script> elements and HTML comments from markup."""
+    text = HTML_COMMENT.sub(" ", str(raw or ""))
+    text = STYLE_ELEMENT.sub(" ", text)
+
+    # An unclosed <style> is common enough in bulk mail to be worth handling,
+    # and handling it badly is expensive: HTMLParser treats everything after
+    # the tag as stylesheet and emits nothing, so the message — code and all —
+    # disappears. Cut the rule text (through its last closing brace before the
+    # next tag) and let the rest of the document through.
+    while True:
+        match = STYLE_OPEN.search(text)
+        if not match:
+            return text
+        rest = text[match.end():]
+        next_tag = rest.find("<")
+        span = rest if next_tag == -1 else rest[:next_tag]
+        close = span.rfind("}")
+        cut = match.end() + (close + 1 if close != -1 else 0)
+        text = text[:match.start()] + " " + text[cut:]
+
+
+def _matching_brace(text, start):
+    depth = 0
+    for index in range(start, len(text)):
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+    return -1
+
+
+def _is_declaration_block(body):
+    """True when a {...} body reads as CSS declarations rather than prose."""
+    parts = [part for part in body.split(";") if part.strip()]
+    if not parts:
+        return False
+    declarations = sum(1 for part in parts if DECLARATION.match(part))
+    return declarations * 2 >= len(parts)
+
+
+def _is_selector(run):
+    run = run.strip()
+    if not run or len(run) > 250:
+        return False
+    for token in re.split(r"\s*,\s*", run):
+        token = token.strip()
+        if not token:
+            return False
+        # Class, id, attribute, universal, pseudo and combinator forms are
+        # unambiguous. A bare word is only a selector if it names an element.
+        head = re.split(r"[\s>+~]+", token)[0]
+        if not head:
+            return False
+        if head[0] == "*":
+            continue
+        if head[0] in ".#[:":
+            # A bare "." is the end of a sentence, not a class.
+            if len(head) < 2:
+                return False
+            continue
+        base = re.split(r"[.#:\[]", head)[0]
+        if SELECTOR_TOKEN.match(base) and base.lower() in SELECTOR_ELEMENTS:
+            continue
+        return False
+    return True
+
+
+def strip_css_text(text):
+    """Remove stylesheet syntax from already-extracted text.
+
+    Conservative by construction: a brace block is only dropped when its
+    contents read as declarations, and the run in front of it is only dropped
+    with it when that run reads as a selector. Prose that happens to contain a
+    brace survives untouched.
+    """
+    source = str(text or "")
+    out = []
+    index = 0
+    length = len(source)
+
+    while index < length:
+        char = source[index]
+
+        if char == "@" and AT_RULE.match(source, index):
+            # @media / @supports / @font-face carry a block; @import and
+            # @charset end at a semicolon. Whichever comes first ends this one.
+            brace = source.find("{", index)
+            semicolon = source.find(";", index)
+            if brace != -1 and (semicolon == -1 or brace < semicolon):
+                end = _matching_brace(source, brace)
+                if end != -1:
+                    index = end + 1
+                    continue
+            elif semicolon != -1:
+                index = semicolon + 1
+                continue
+
+        if char == "{":
+            end = _matching_brace(source, index)
+            if end != -1 and _is_declaration_block(source[index + 1:end]):
+                # Take the selector with the block. The run back to the
+                # previous statement boundary is tested whole first, so a
+                # selector spanning several lines goes in one piece; failing
+                # that, each line-start inside it is tried, longest first, so
+                # a rule sitting under a sentence loses the rule and not the
+                # sentence. Candidates are always whole runs — testing them a
+                # character at a time would ask whether `d[class="x"]` is a
+                # selector, which is not a question with a useful answer.
+                cut = len(out)
+                limit = max(0, cut - 250)
+                start = cut
+                while start > limit and out[start - 1] not in "};":
+                    start -= 1
+
+                run = "".join(out[start:cut])
+                for offset in [0] + [m.end() for m in re.finditer(r"\n", run)]:
+                    if _is_selector(run[offset:]):
+                        del out[start + offset:cut]
+                        break
+
+                index = end + 1
+                continue
+
+        out.append(char)
+        index += 1
+
+    return "".join(out)
+
+
+class _TextExtractor(HTMLParser):
+    """Good-enough HTML to text: drop the machinery, keep the words.
+
+    Marketing mail is mostly tables and inline CSS, and the model only needs
+    the sentence with the code in it. A real HTML renderer would be a
+    dependency; this is a hundred lines cheaper and loses nothing that
+    matters for classification.
+    """
+
+    SKIP = {"script", "style", "head", "title", "meta", "noscript"}
+    BREAK = {"p", "br", "div", "tr", "li", "h1", "h2", "h3", "h4", "table"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self._depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP:
+            self._depth += 1
+        elif tag in self.BREAK:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP and self._depth:
+            self._depth -= 1
+        elif tag in self.BREAK:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if not self._depth:
+            self.parts.append(data)
+
+    def text(self):
+        return "".join(self.parts)
+
+
+def html_to_text(raw):
+    # The stylesheet is gone before the parser starts, so both paths below —
+    # the parser and the tag-stripping fallback — see markup that has none.
+    # The fallback especially: it removes tags but keeps what sits between
+    # them, which for a <style> element is the whole stylesheet.
+    cleaned = strip_style_elements(raw)
+    parser = _TextExtractor()
+    try:
+        parser.feed(cleaned)
+        parser.close()
+    except Exception:
+        return strip_css_text(re.sub(r"<[^>]+>", " ", cleaned))
+    return strip_css_text(parser.text())
+
+
+def collapse(text):
+    text = text.replace("\r", "")
+    text = re.sub(r"[ \t ]+", " ", text)
+    text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
+    return text.strip()
+
+
+def decode_header(value):
+    if not value:
+        return ""
+    try:
+        parts = email.header.decode_header(value)
+    except Exception:
+        return str(value)
+    out = []
+    for chunk, charset in parts:
+        if isinstance(chunk, bytes):
+            try:
+                out.append(chunk.decode(charset or "utf-8", "replace"))
+            except (LookupError, UnicodeDecodeError):
+                out.append(chunk.decode("utf-8", "replace"))
+        else:
+            out.append(chunk)
+    return collapse("".join(out))
+
+
+def part_text(part):
+    payload = part.get_payload(decode=True)
+    if payload is None:
+        return ""
+    charset = part.get_content_charset() or "utf-8"
+    try:
+        return payload.decode(charset, "replace")
+    except (LookupError, UnicodeDecodeError):
+        return payload.decode("utf-8", "replace")
+
+
+def message_body(msg, limit):
+    """Prefer text/plain; fall back to the HTML alternative, stripped."""
+    plain, html = [], []
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.is_multipart():
+                continue
+            disposition = str(part.get("Content-Disposition") or "")
+            if "attachment" in disposition.lower():
+                continue
+            ctype = part.get_content_type()
+            if ctype == "text/plain":
+                plain.append(part_text(part))
+            elif ctype == "text/html":
+                html.append(part_text(part))
+    else:
+        if msg.get_content_type() == "text/html":
+            html.append(part_text(msg))
+        else:
+            plain.append(part_text(msg))
+
+    # The plain part is scrubbed too: it never meets an HTML parser, and
+    # senders do paste stylesheets into it.
+    text = collapse(strip_css_text("\n".join(plain)))
+    rich = collapse(html_to_text("\n".join(html))) if html else ""
+    return choose_body(text, rich)[:limit]
+
+
+def choose_body(plain, rich):
+    """Pick the part that actually carries the message.
+
+    text/plain wins whenever it says anything — an OTP mail's plain part is
+    often no more than "Your code is 281940", and a length threshold generous
+    enough to call that empty would throw away the only line that matters.
+
+    The exception is the stub: senders who put "View this email in your
+    browser" in text/plain and the real message in HTML. A short plain part
+    with no digits, alongside an HTML part that has them, is that case — and
+    digits are exactly what a code or an amount is made of.
+    """
+    if len(plain) < 12:
+        return rich or plain
+    if rich and len(plain) < 120 and not re.search(r"\d", plain) and re.search(r"\d", rich):
+        return rich
+    return plain
+
+
+# --------------------------------------------------- offline classification
+
+
+OTP_PATTERNS = [
+    re.compile(
+        r"(?:code|otp|passcode|pin|token|password)\D{0,24}?\b(\d{4,8})\b", re.I
+    ),
+    re.compile(r"\b(\d{4,8})\b\D{0,24}?(?:is your|as your|verification|one[- ]time)", re.I),
+]
+OTP_HINTS = re.compile(
+    r"\b(one[- ]time|verification code|security code|login code|otp|2fa|"
+    r"two[- ]factor|passcode|confirm your|authentication code)\b",
+    re.I,
+)
+MONEY = re.compile(
+    r"(?:(?:rs\.?|inr|usd|eur|gbp|aud|cad|\$|€|£|₹)\s?)"
+    r"([0-9][0-9,]*(?:\.[0-9]{1,2})?)",
+    re.I,
+)
+TXN_HINTS = re.compile(
+    r"\b(debited|credited|charged|payment|transaction|receipt|invoice|purchase|"
+    r"withdrawn|deposited|refund|order total|you paid|amount of)\b",
+    re.I,
+)
+SECURITY_HINTS = re.compile(
+    r"\b(new sign[- ]?in|new login|suspicious|unusual activity|password (?:was )?"
+    r"(?:changed|reset)|account (?:locked|compromised)|security alert|"
+    r"unrecognized device)\b",
+    re.I,
+)
+DELIVERY_HINTS = re.compile(
+    r"\b(shipped|out for delivery|delivered|tracking number|dispatched|"
+    r"arriving|your package|courier)\b",
+    re.I,
+)
+ACCOUNT_TAIL = re.compile(r"(?:x{2,}|\*{2,}|ending(?: in)?|xx)\s*(\d{3,4})\b", re.I)
+
+
+def heuristic_verdict(meta, body):
+    """A local read of the message, used two ways.
+
+    It rides along with every LLM call as a hint, and it stands in for the
+    model entirely when the endpoint is unreachable — an OTP should still
+    reach the screen when the network or the API key is having a bad day.
+    """
+    blob = f"{meta['subject']}\n{body}"
+    sender_name = meta["from_name"] or meta["from_domain"] or "Mail"
+
+    verdict = {
+        "category": "other",
+        "title": sender_name,
+        "headline": meta["subject"][:70] or "New message",
+        "detail": "",
+        "code": "",
+        "amount": "",
+        "merchant": "",
+        "account_hint": "",
+        "expires_minutes": 0,
+        "confidence": 0.3,
+        "source": "heuristic",
+    }
+
+    tail = ACCOUNT_TAIL.search(blob)
+    if tail:
+        verdict["account_hint"] = "••" + tail.group(1)
+
+    if OTP_HINTS.search(blob):
+        for pattern in OTP_PATTERNS:
+            found = pattern.search(blob)
+            if found:
+                verdict.update(
+                    category="otp",
+                    code=found.group(1),
+                    headline=f"{sender_name} code",
+                    detail=meta["subject"][:90],
+                    confidence=0.72,
+                )
+                return verdict
+
+    if TXN_HINTS.search(blob):
+        money = MONEY.search(blob)
+        verdict.update(
+            category="transaction",
+            amount=money.group(0).strip() if money else "",
+            headline=f"{sender_name} transaction",
+            detail=meta["subject"][:90],
+            confidence=0.6 if money else 0.45,
+        )
+        return verdict
+
+    if SECURITY_HINTS.search(blob):
+        verdict.update(
+            category="security",
+            headline=f"{sender_name} security alert",
+            detail=meta["subject"][:90],
+            confidence=0.6,
+        )
+        return verdict
+
+    if DELIVERY_HINTS.search(blob):
+        verdict.update(
+            category="delivery",
+            headline=f"{sender_name} delivery",
+            detail=meta["subject"][:90],
+            confidence=0.55,
+        )
+        return verdict
+
+    return verdict
+
+
+# ------------------------------------------------------------- LLM verdict
+
+
+SYSTEM_PROMPT = (
+    "You triage a single email for a desktop notification. Answer only with "
+    "the JSON object the schema describes.\n"
+    "Rules:\n"
+    "- category 'otp' only when the message carries a code the user is meant "
+    "to type somewhere right now. Put the digits or characters in `code`, "
+    "with no spaces or punctuation.\n"
+    "- category 'transaction' for money that moved: a charge, payment, "
+    "refund, transfer, receipt or invoice. Fill `amount` exactly as written "
+    "including its currency symbol, and `merchant` with who was paid.\n"
+    "- category 'security' for sign-ins, password changes, and account "
+    "warnings that carry no code.\n"
+    "- category 'delivery' for shipping and order tracking.\n"
+    "- category 'calendar' for invitations and meeting changes.\n"
+    "- category 'other' for everything else, including marketing, "
+    "newsletters, and ordinary correspondence.\n"
+    "- `headline` is at most 60 characters and never repeats the subject "
+    "verbatim when it can say something more useful.\n"
+    "- `detail` is at most 110 characters.\n"
+    "- `title` is the sending brand or person, two or three words at most.\n"
+    "- `expires_minutes` is the code's stated validity, 0 when unstated.\n"
+    "- `confidence` is your own certainty in the category, 0 to 1.\n"
+    "- Leave a field as an empty string when the message does not say. "
+    "Never invent an amount, a merchant, or a code."
+)
+
+VERDICT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "category", "title", "headline", "detail", "code",
+        "amount", "merchant", "account_hint", "expires_minutes", "confidence",
+    ],
+    "properties": {
+        "category": {"type": "string", "enum": list(CATEGORIES)},
+        "title": {"type": "string"},
+        "headline": {"type": "string"},
+        "detail": {"type": "string"},
+        "code": {"type": "string"},
+        "amount": {"type": "string"},
+        "merchant": {"type": "string"},
+        "account_hint": {"type": "string"},
+        "expires_minutes": {"type": "integer"},
+        "confidence": {"type": "number"},
+    },
+}
+
+
+def post_json(url, payload, headers, timeout):
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8", "replace"))
+
+
+def classify(config, meta, body, hint):
+    llm = config["llm"]
+    if not llm.get("enabled", True):
+        return hint
+
+    api_key = resolve_secret("HERALD_API_KEY", llm)
+    base = str(llm.get("baseUrl", "")).rstrip("/")
+    if not base:
+        return hint
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = "Bearer " + api_key
+    for key, value in (llm.get("extraHeaders") or {}).items():
+        headers[str(key)] = str(value)
+
+    user_prompt = (
+        f"From: {meta['from_display']}\n"
+        f"Subject: {meta['subject']}\n"
+        f"Date: {meta['date']}\n"
+        f"Local guess (may be wrong): {hint['category']}\n"
+        f"---\n{body}"
+    )
+
+    payload = {
+        "model": llm.get("model", "gpt-4o-mini"),
+        "temperature": 0,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "mail_verdict",
+                "strict": True,
+                "schema": VERDICT_SCHEMA,
+            },
+        },
+    }
+    if int(llm.get("maxTokens") or 0) > 0:
+        payload["max_tokens"] = int(llm["maxTokens"])
+
+    url = base + "/chat/completions"
+    timeout = float(llm.get("timeoutSeconds", 45))
+
+    # Two shots: strict structured output, then plain JSON mode. Local servers
+    # (Ollama, llama.cpp, older vLLM) reject json_schema with a 400, and a
+    # notification is worth more than a perfectly typed response.
+    attempts = [payload]
+    relaxed = dict(payload)
+    relaxed["response_format"] = {"type": "json_object"}
+    relaxed["messages"] = [
+        {"role": "system", "content": SYSTEM_PROMPT + "\nReturn a JSON object with exactly these keys: "
+         + ", ".join(VERDICT_SCHEMA["required"]) + "."},
+        {"role": "user", "content": user_prompt},
+    ]
+    attempts.append(relaxed)
+
+    last_error = ""
+    for attempt in attempts:
+        try:
+            data = post_json(url, attempt, headers, timeout)
+            content = data["choices"][0]["message"]["content"]
+            return normalize_verdict(json.loads(content), hint)
+        except urllib.error.HTTPError as err:
+            detail = err.read().decode("utf-8", "replace")[:200] if err.fp else ""
+            last_error = f"HTTP {err.code} {detail}"
+            if err.code not in (400, 404, 422):
+                break
+        except (urllib.error.URLError, OSError) as err:
+            last_error = f"network: {err}"
+            break
+        except (KeyError, IndexError, ValueError) as err:
+            last_error = f"bad response: {err}"
+
+    log("warn", f"llm classify failed ({last_error}); using local heuristics")
+    hint = dict(hint)
+    hint["llm_error"] = last_error[:160]
+    return hint
+
+
+def normalize_verdict(raw, hint):
+    verdict = dict(hint)
+    verdict["source"] = "llm"
+    verdict.pop("llm_error", None)
+
+    category = str(raw.get("category", "")).strip().lower()
+    verdict["category"] = category if category in CATEGORIES else hint["category"]
+
+    for key, limit in (("title", 40), ("headline", 70), ("detail", 120),
+                       ("amount", 24), ("merchant", 40), ("account_hint", 16)):
+        value = raw.get(key)
+        if isinstance(value, str) and value.strip():
+            verdict[key] = collapse(value)[:limit]
+
+    code = raw.get("code")
+    if isinstance(code, str):
+        verdict["code"] = re.sub(r"[\s\-–]", "", code)[:16]
+
+    try:
+        verdict["expires_minutes"] = max(0, int(raw.get("expires_minutes") or 0))
+    except (TypeError, ValueError):
+        verdict["expires_minutes"] = 0
+
+    try:
+        verdict["confidence"] = min(1.0, max(0.0, float(raw.get("confidence", 0.5))))
+    except (TypeError, ValueError):
+        verdict["confidence"] = 0.5
+
+    # A category of 'otp' with nothing to type is a misread. Demote it rather
+    # than showing a code notification with an empty code.
+    if verdict["category"] == "otp" and not verdict["code"]:
+        verdict["category"] = "security" if hint["category"] == "other" else hint["category"]
+
+    return verdict
+
+
+# ------------------------------------------------------------ notification
+
+
+def notification_lines(event):
+    """Headline and body for the toast. Kept here so --once shows the real thing."""
+    category = event["category"]
+    title = event.get("title") or "Mail"
+
+    if category == "otp":
+        code = event.get("code", "")
+        spaced = " ".join([code[i:i + 3] for i in range(0, len(code), 3)]) if len(code) > 4 else code
+        headline = f"{title}  ·  {spaced}"
+        bits = [event.get("detail") or event.get("headline") or ""]
+        if event.get("expires_minutes"):
+            # Same phrasing as the panel row, and short enough that the whole
+            # body still fits on one line of the toast.
+            bits.append(f"{event['expires_minutes']}m left")
+        bits.append("click to copy")
+        return headline, "  ·  ".join([b for b in bits if b])
+
+    if category == "transaction":
+        amount = event.get("amount") or ""
+        merchant = event.get("merchant") or title
+        headline = f"{amount} · {merchant}".strip(" ·") or event["headline"]
+        detail = event.get("detail") or event.get("headline") or ""
+        if event.get("account_hint"):
+            detail = f"{detail}  ·  {event['account_hint']}".strip(" ·")
+        return headline, detail
+
+    return event.get("headline") or title, event.get("detail") or ""
+
+
+def send_notification(config, event, plugin_bin):
+    urgency = config["notify"]["categories"].get(event["category"], "off")
+    if urgency == "off":
+        return False
+    if event.get("confidence", 1.0) < float(config["notify"].get("minConfidence", 0)):
+        return False
+
+    headline, body = notification_lines(event)
+    argv = [
+        "omarchy", "notification", "send",
+        "--app-name", "herald",
+        "-g", GLYPHS.get(event["category"], GLYPHS["other"]),
+        "-u", urgency,
+        "-t", str(int(config["notify"].get("expireMs", 12000))),
+        headline,
+    ]
+    if body:
+        argv.append(body)
+
+    # Clicking the toast runs this argv verbatim — omarchy-notification-send
+    # never re-parses it through a shell, so the event id cannot become a
+    # command no matter what the sender put in the subject line.
+    action = os.path.join(plugin_bin, "herald-action")
+    if os.access(action, os.X_OK):
+        verb = "copy" if event.get("code") else "show"
+        argv += ["--exec", action, verb, event["id"]]
+
+    try:
+        subprocess.run(argv, check=False, timeout=15,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as err:
+        log("warn", f"notification failed: {err}")
+        return False
+    return True
+
+
+def copy_code(code):
+    try:
+        subprocess.run(
+            ["wl-copy", "--sensitive"], input=code, text=True, check=False, timeout=10,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+# -------------------------------------------------------------- IMAP watch
+
+
+class Watcher:
+    def __init__(self, config, plugin_bin, dry_run=False):
+        self.config = config
+        self.plugin_bin = plugin_bin
+        self.dry_run = dry_run
+        self.imap = None
+        self.stopping = False
+        self.auth_failures = 0
+        self.exit_code = 0
+        self.account = f"{config['imap'].get('username', '')}"
+        self.state = read_state()
+        self.state_key = "{}|{}|{}".format(
+            config["imap"].get("host", ""),
+            config["imap"].get("username", ""),
+            config["imap"].get("mailbox", "INBOX"),
+        )
+
+    # ---- connection
+
+    def connect(self):
+        cfg = self.config["imap"]
+        host, port = cfg["host"], int(cfg["port"])
+        password = resolve_secret("HERALD_IMAP_PASSWORD", cfg)
+        if not host or not cfg.get("username") or not password:
+            raise FatalConfig(
+                "IMAP host, username, and password are all required "
+                "(run `herald-setup`)"
+            )
+
+        status("connecting", f"{cfg['username']} @ {host}", cfg["username"])
+        if cfg.get("ssl", True) and not cfg.get("starttls"):
+            self.imap = imaplib.IMAP4_SSL(host, port)
+        else:
+            self.imap = imaplib.IMAP4(host, port)
+            if cfg.get("starttls"):
+                self.imap.starttls()
+
+        try:
+            self.imap.login(cfg["username"], password)
+        except imaplib.IMAP4.error as err:
+            raise AuthRejected(str(err)) from err
+
+        self.imap.select(cfg.get("mailbox", "INBOX"))
+        self.auth_failures = 0
+        status("watching", f"{cfg['username']} · {cfg.get('mailbox', 'INBOX')}",
+               cfg["username"])
+
+    def disconnect(self):
+        if not self.imap:
+            return
+        for step in (self.imap.close, self.imap.logout):
+            try:
+                step()
+            except Exception:
+                pass
+        self.imap = None
+
+    # ---- uid bookkeeping
+
+    def all_uids(self):
+        typ, data = self.imap.uid("SEARCH", None, "ALL")
+        if typ != "OK" or not data or not data[0]:
+            return []
+        return [int(x) for x in data[0].split()]
+
+    def new_uids(self, last_uid):
+        typ, data = self.imap.uid("SEARCH", None, f"UID {last_uid + 1}:*")
+        if typ != "OK" or not data or not data[0]:
+            return []
+        # `N:*` always returns at least the highest UID, even when it is below
+        # N, so the filter below is what actually decides what is new.
+        return sorted(uid for uid in (int(x) for x in data[0].split()) if uid > last_uid)
+
+    def baseline(self):
+        """Where to start reading on a first run for this mailbox."""
+        known = self.state.get(self.state_key, {}).get("lastUid")
+        if isinstance(known, int):
+            return known
+
+        uids = self.all_uids()
+        if not uids:
+            return 0
+        backfill = max(0, int(self.config["scan"].get("backfill", 0)))
+        start = uids[-backfill - 1] if backfill and len(uids) > backfill else (
+            0 if backfill else uids[-1]
+        )
+        return start
+
+    def remember(self, last_uid):
+        self.state[self.state_key] = {"lastUid": last_uid, "ts": time.time()}
+        write_state(self.state)
+
+    # ---- one message
+
+    def fetch(self, uid):
+        typ, data = self.imap.uid("FETCH", str(uid), "(BODY.PEEK[])")
+        if typ != "OK" or not data or not isinstance(data[0], tuple):
+            return None
+        return email.message_from_bytes(data[0][1])
+
+    def meta_for(self, msg, uid):
+        raw_from = decode_header(msg.get("From", ""))
+        name, address = email.utils.parseaddr(raw_from)
+        domain = address.split("@")[-1] if "@" in address else ""
+        return {
+            "uid": uid,
+            "subject": decode_header(msg.get("Subject", "")),
+            "from_display": raw_from,
+            "from_name": name,
+            "from_address": address,
+            "from_domain": domain,
+            "date": decode_header(msg.get("Date", "")),
+            "message_id": decode_header(msg.get("Message-ID", "")),
+        }
+
+    def denied(self, meta):
+        for pattern in self.config["scan"].get("senderDenylist", []):
+            try:
+                if re.search(pattern, meta["from_display"], re.I):
+                    return True
+            except re.error:
+                continue
+        for pattern in self.config["scan"].get("subjectDenylist", []):
+            try:
+                if re.search(pattern, meta["subject"], re.I):
+                    return True
+            except re.error:
+                continue
+        return False
+
+    def process(self, uid):
+        msg = self.fetch(uid)
+        if msg is None:
+            return
+
+        meta = self.meta_for(msg, uid)
+        if self.denied(meta):
+            log("info", f"skipped (denylist): {meta['subject'][:60]}")
+            return
+
+        body = message_body(msg, int(self.config["llm"].get("maxBodyChars", 4000)))
+        hint = heuristic_verdict(meta, body)
+        verdict = classify(self.config, meta, body, hint)
+
+        seed = meta["message_id"] or f"{self.state_key}:{uid}"
+        event = dict(verdict)
+        event.update({
+            "t": "event",
+            "id": hashlib.sha1(seed.encode("utf-8")).hexdigest()[:16],
+            "uid": uid,
+            "subject": meta["subject"],
+            "sender": meta["from_display"],
+            "senderAddress": meta["from_address"],
+            "account": self.account,
+            "receivedAt": time.time(),
+        })
+
+        notified = False if self.dry_run else send_notification(
+            self.config, event, self.plugin_bin
+        )
+        event["notified"] = notified
+
+        if (event["category"] == "otp" and event.get("code")
+                and self.config["notify"].get("autoCopyOtp", True) and not self.dry_run):
+            copy_code(event["code"])
+            event["copied"] = True
+
+        append_event(event)
+        emit(event)
+
+    # ---- the loop
+
+    def wait(self):
+        """Block until the server says something arrived, or the idle window ends."""
+        poll = max(30, int(self.config["scan"].get("pollSeconds", 300)))
+        if hasattr(self.imap, "idle"):
+            try:
+                with self.imap.idle(duration=IDLE_SECONDS) as idler:
+                    for typ, _data in idler:
+                        if typ in ("EXISTS", "RECENT"):
+                            return
+                return
+            except (imaplib.IMAP4.abort, imaplib.IMAP4.error, OSError):
+                raise
+            except Exception as err:
+                # A server that advertises IDLE badly should degrade to polling
+                # rather than take the whole watcher down.
+                log("warn", f"IDLE unavailable, polling instead: {err}")
+
+        deadline = time.time() + poll
+        while time.time() < deadline and not self.stopping:
+            time.sleep(1)
+        try:
+            self.imap.noop()
+        except Exception:
+            raise
+
+    def cycle(self, last_uid):
+        fresh = self.new_uids(last_uid)
+        if not fresh:
+            return last_uid
+        cap = max(1, int(self.config["scan"].get("maxPerCycle", 12)))
+        if len(fresh) > cap:
+            log("warn", f"{len(fresh)} new messages; classifying the newest {cap}")
+            fresh = fresh[-cap:]
+        for uid in fresh:
+            if self.stopping:
+                break
+            try:
+                self.process(uid)
+            except Exception as err:
+                log("error", f"uid {uid}: {err}")
+            last_uid = max(last_uid, uid)
+            self.remember(last_uid)
+        return last_uid
+
+    def run_once(self, count):
+        """Classify the newest `count` messages and exit. The config check."""
+        self.connect()
+        uids = self.all_uids()
+        if not uids:
+            log("info", "mailbox is empty")
+            return
+        for uid in uids[-count:]:
+            self.process(uid)
+
+    def sleep_for(self, seconds):
+        slept = 0
+        while slept < seconds and not self.stopping:
+            time.sleep(1)
+            slept += 1
+
+    def run(self):
+        backoff = 5
+        while not self.stopping:
+            try:
+                self.connect()
+                backoff = 5
+                last_uid = self.baseline()
+                self.remember(last_uid)
+                last_uid = self.cycle(last_uid)
+
+                while not self.stopping:
+                    self.wait()
+                    if self.stopping:
+                        break
+                    last_uid = self.cycle(last_uid)
+
+            except FatalConfig as err:
+                status("unconfigured", str(err)[:200])
+                self.exit_code = EXIT_UNCONFIGURED
+                break
+
+            except AuthRejected as err:
+                self.auth_failures += 1
+                if self.auth_failures >= MAX_AUTH_FAILURES:
+                    status("error", f"login rejected {self.auth_failures} times — "
+                                    f"not retrying ({str(err)[:100]})")
+                    self.exit_code = EXIT_AUTH
+                    break
+                status("error", f"login rejected: {str(err)[:150]}")
+                self.disconnect()
+                self.sleep_for(backoff)
+                backoff = min(120, backoff * 2)
+
+            except Exception as err:
+                if self.stopping:
+                    break
+                status("error", str(err)[:200])
+                log("error", f"watcher: {err}")
+                self.disconnect()
+                # Cap the backoff at two minutes: a transient DNS or Wi-Fi
+                # blip should not leave the mailbox unwatched for an hour.
+                self.sleep_for(backoff)
+                backoff = min(120, backoff * 2)
+
+            finally:
+                self.disconnect()
+
+        if not self.exit_code:
+            status("stopped", "")
+
+
+# --------------------------------------------------------------- entrypoint
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", default=os.environ.get("HERALD_CONFIG", CONFIG_PATH))
+    parser.add_argument("--once", type=int, metavar="N", default=0,
+                        help="classify the newest N messages, then exit")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="never raise a notification or touch the clipboard")
+    args = parser.parse_args()
+
+    try:
+        config = load_config(args.config)
+    except ValueError as err:
+        status("error", f"config is not valid JSON: {err}")
+        return 2
+    if config is None:
+        status("unconfigured", args.config)
+        log("error", f"no config at {args.config} — run herald-setup")
+        return 3
+
+    plugin_bin = os.path.dirname(os.path.abspath(__file__))
+    watcher = Watcher(config, plugin_bin, dry_run=args.dry_run)
+
+    def stop(_signum, _frame):
+        watcher.stopping = True
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    status("starting", config["imap"].get("username", ""),
+           config["imap"].get("username", ""))
+    try:
+        if args.once:
+            watcher.run_once(args.once)
+        else:
+            watcher.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        watcher.disconnect()
+    return watcher.exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
